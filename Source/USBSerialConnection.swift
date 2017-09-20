@@ -1,56 +1,75 @@
 //
 //  USBSerialConnection.swift
+//  NovaSerialUSB
 //
 
 import Foundation
 import IOKit
 
 protocol USBSerialConnectionDelegate {
-    func device(device: USBSerialConnection, dataRead: NSData)
-    func deviceConnected(device: USBSerialConnection)
-    func deviceDisonnected(device: USBSerialConnection)
+    func device(_ device: USBSerialConnection, dataRead: Data)
+    func deviceConnected(_ device: USBSerialConnection)
+    func deviceDisonnected(_ device: USBSerialConnection)
 }
 
 class USBSerialConnection {
-
-    private static let CalloutDeviceKey = "IOCalloutDevice"
     
-    private var serialFileHandle: NSFileHandle?
+    fileprivate static let CalloutDeviceKey = "IOCalloutDevice"
+    
+    fileprivate var serialFileHandle: FileHandle?
     var delegate: USBSerialConnectionDelegate?
     
-    let vendorId: Int
-    let productId: Int
+    let vendorId: UInt16
+    let productId: UInt16
     let vendorName: String?
     let productName: String?
     
-    init(vendorId: Int, productId: Int, vendorName: String? = nil, productName: String? = nil) {
+    init(vendorId: UInt16, productId: UInt16, vendorName: String? = nil, productName: String? = nil) {
         self.vendorId = vendorId
         self.productId = productId
         self.vendorName = vendorName
         self.productName = productName
-        
     }
     
-func startScan() {
-        let matchingDict = IOServiceMatching("IOUSBHostDevice")
-        let vendorKey = "idVendor" as CFStringRef!
-        CFDictionarySetValue(matchingDict, unsafeAddressOf(vendorKey), unsafeAddressOf(vendorId))
-        let productKey = "idProduct" as CFStringRef!
-        CFDictionarySetValue(matchingDict, unsafeAddressOf(productKey), unsafeAddressOf(productId))
+    private var isScanning: Bool = false
+    private var matchedIterator: io_iterator_t = 0
+    private var removedIterator: io_iterator_t = 0
+    func startScan() {
+        if isScanning {
+            return
+        }
+        isScanning = true
+        let matchingDict: NSMutableDictionary = IOServiceMatching("IOUSBHostDevice")
+        matchingDict["idVendor"] = vendorId as NSNumber
+        matchingDict["idProduct"] = productId as NSNumber
+        
         let notifyPort = IONotificationPortCreate(kIOMasterPortDefault)
-        var portIterator: io_iterator_t = 0
-        let runLoop = NSRunLoop.currentRunLoop().getCFRunLoop()
-        let runLoopSource = IONotificationPortGetRunLoopSource(notifyPort)
-        CFRunLoopAddSource(runLoop, runLoopSource.takeRetainedValue(), kCFRunLoopCommonModes)
-        let observer: UnsafeMutablePointer<Void> = bridge(self)
-        IOServiceAddMatchingNotification(notifyPort, kIOFirstMatchNotification, matchingDict, DeviceMatched, observer, &portIterator)
-        DeviceMatched(observer, iterator: portIterator)
-        IOServiceAddMatchingNotification(notifyPort, kIOTerminatedNotification, matchingDict, DeviceRemoved, observer, &portIterator)
-        DeviceRemoved(observer, iterator: portIterator)
+        let runLoop = RunLoop.current.getCFRunLoop()
+        let runLoopSource = IONotificationPortGetRunLoopSource(notifyPort).takeUnretainedValue()
+        CFRunLoopAddSource(runLoop, runLoopSource, CFRunLoopMode.commonModes)
+        
+        let observer: UnsafeMutableRawPointer = bridge(self)
+        IOServiceAddMatchingNotification(notifyPort, kIOFirstMatchNotification, matchingDict, DeviceMatched, observer, &matchedIterator)
+        DeviceMatched(observer, iterator: matchedIterator)
+        IOServiceAddMatchingNotification(notifyPort, kIOTerminatedNotification, matchingDict, DeviceRemoved, observer, &removedIterator)
+        DeviceRemoved(observer, iterator: removedIterator)
     }
     
     func stopScan() {
-        // uhh.... how do I rereg those notifiers?
+        if matchedIterator != 0 {
+            IOObjectRelease(matchedIterator)
+            matchedIterator = 0
+        }
+        if removedIterator != 0 {
+            IOObjectRelease(removedIterator)
+            removedIterator = 0
+        }
+    }
+    
+    func disconnect() {
+        serialFileHandle?.readabilityHandler = nil
+        serialFileHandle?.closeFile()
+        serialFileHandle = nil
     }
     
     var connected: Bool {
@@ -58,15 +77,12 @@ func startScan() {
     }
     
     deinit {
-        serialFileHandle?.readabilityHandler = nil
-        serialFileHandle?.closeFile()
-        serialFileHandle = nil
+        disconnect()
     }
     
-    private func deviceConnected(device: io_object_t) {
+    fileprivate func deviceConnected(_ device: io_object_t) {
         // Callout key takes time to populate apparently. :-/
-        let delayTime = dispatch_time(DISPATCH_TIME_NOW, Int64(1 * Double(NSEC_PER_SEC)))
-        dispatch_after(delayTime, dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_BACKGROUND, 0)) {
+        DispatchQueue.global(qos: .background).asyncAfter(deadline: DispatchTime.now() + DispatchTimeInterval.seconds(1)) {
             if let calloutDevice = self.propertyForDevice(device, property: USBSerialConnection.CalloutDeviceKey) {
                 self.openSerialFile(calloutDevice)
             }
@@ -74,10 +90,10 @@ func startScan() {
         }
     }
     
-    private func openSerialFile(path: String) {
-        if let fileHandle = NSFileHandle(forUpdatingAtPath: path) {
-            serialFileHandle = fileHandle
-            delegate?.deviceConnected(self)
+    fileprivate func openSerialFile(_ path: String) {
+        if let fileHandle = FileHandle(forUpdatingAtPath: path) {
+            self.serialFileHandle = fileHandle
+            self.delegate?.deviceConnected(self)
             fileHandle.readabilityHandler = { [weak self] fileHandle in
                 if let s = self {
                     s.delegate?.device(s, dataRead: fileHandle.availableData)
@@ -86,8 +102,9 @@ func startScan() {
         }
     }
     
-    private func deviceDisconnected(device: io_object_t) {
+    fileprivate func deviceDisconnected(_ device: io_object_t) {
         if let _ = propertyForDevice(device, property: USBSerialConnection.CalloutDeviceKey) {
+            serialFileHandle?.readabilityHandler = nil
             serialFileHandle?.closeFile()
             serialFileHandle = nil
             delegate?.deviceDisonnected(self)
@@ -95,24 +112,24 @@ func startScan() {
         IOObjectRelease(device)
     }
     
-    private func propertyForDevice(device: io_object_t, property: String) -> String? {
-        if let calloutKey = IORegistryEntrySearchCFProperty(device, kIOServicePlane, property, kCFAllocatorDefault, IOOptionBits(kIORegistryIterateRecursively)) {
+    fileprivate func propertyForDevice(_ device: io_object_t, property: String) -> String? {
+        if let calloutKey = IORegistryEntrySearchCFProperty(device, kIOServicePlane, property as CFString, kCFAllocatorDefault, IOOptionBits(kIORegistryIterateRecursively)) {
             return calloutKey as? String
         }
         return nil
     }
     
-    func writeData(data: NSData) {
-        serialFileHandle?.writeData(data)
+    func writeData(_ data: Data) {
+        serialFileHandle?.write(data)
     }
     
 }
 
 
-
-private func DeviceMatched(uscPtr: UnsafeMutablePointer<Void>, iterator: io_iterator_t) -> Void {
+private func DeviceMatched(_ uscPtr: UnsafeMutableRawPointer?, iterator: io_iterator_t) -> Void {
+    guard let uscPtr = uscPtr else { return }
     let usc: USBSerialConnection = bridge(uscPtr)
-    while case let device = IOIteratorNext(iterator) where device != 0 {
+    while case let device = IOIteratorNext(iterator), device != 0 {
         if let matchVendor = usc.vendorName {
             guard let vendor = usc.propertyForDevice(device, property: "USB Vendor Name") else { continue }
             if matchVendor != vendor {
@@ -129,17 +146,19 @@ private func DeviceMatched(uscPtr: UnsafeMutablePointer<Void>, iterator: io_iter
     }
 }
 
-private func DeviceRemoved(uscPtr: UnsafeMutablePointer<Void>, iterator: io_iterator_t) -> Void {
+private func DeviceRemoved(_ uscPtr: UnsafeMutableRawPointer?, iterator: io_iterator_t) -> Void {
+    guard let uscPtr = uscPtr else { return }
     let usc: USBSerialConnection = bridge(uscPtr)
-    while case let device = IOIteratorNext(iterator) where device != 0 {
+    while case let device = IOIteratorNext(iterator), device != 0 {
         usc.deviceDisconnected(device)
     }
 }
 
-private func bridge<T: AnyObject>(obj: T) -> UnsafeMutablePointer<Void> {
-    return UnsafeMutablePointer(Unmanaged.passUnretained(obj).toOpaque())
+private func bridge<T: AnyObject>(_ obj: T) -> UnsafeMutableRawPointer {
+    return Unmanaged.passUnretained(obj).toOpaque()
 }
 
-private func bridge<T: AnyObject>(ptr: UnsafeMutablePointer<Void>) -> T {
-    return Unmanaged<T>.fromOpaque(COpaquePointer(ptr)).takeUnretainedValue()
+private func bridge<T: AnyObject>(_ ptr: UnsafeMutableRawPointer) -> T {
+    return Unmanaged.fromOpaque(ptr).takeUnretainedValue()
 }
+

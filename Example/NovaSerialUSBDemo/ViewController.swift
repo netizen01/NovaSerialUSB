@@ -2,9 +2,6 @@
 //  ViewController.swift
 //  NovaSerialUSBDemo
 //
-//  Created by Joel Stewart on 6/28/16.
-//  Copyright © 2016 Example. All rights reserved.
-//
 
 import Cocoa
 
@@ -16,7 +13,7 @@ class ViewController: NSViewController {
         // Do any additional setup after loading the view.
     }
 
-    override var representedObject: AnyObject? {
+    override var representedObject: Any? {
         didSet {
         // Update the view, if already loaded.
         }
